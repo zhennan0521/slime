@@ -412,7 +412,7 @@ async def generate_rollout_async(
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}",
                 )
                 do_print = False
 
@@ -554,8 +554,7 @@ async def eval_rollout_single_dataset(
         if do_print:
             logger.info(
                 "eval_rollout_single_dataset example data: "
-                f"{[str(sample.prompt) + sample.response]} "
-                f"reward={sample.reward}"
+                f"{[str(sample.prompt) + sample.response]}"
             )
             do_print = False
         if isinstance(sample, list):
