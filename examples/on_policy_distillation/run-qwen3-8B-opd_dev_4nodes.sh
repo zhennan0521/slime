@@ -1,23 +1,43 @@
 #!/bin/bash
 
-# usage: bash examples/on_policy_distillation/run-qwen3-8B-opd.sh
+# usage: bash examples/on_policy_distillation/run-qwen3-8B-opd_dev_4nodes.sh
+# 3 nodes train/rollout (1 actor + 2 rollout) + 1 node teacher (external)
 
 set -ex
 
+# ============================================================
+# Load .env (SLIME_DIR, DATASETS_DIR, MODELS_DIR, WANDB_*, etc.)
+# ============================================================
+if [ -f .env ]; then
+    set -a; source .env; set +a
+else
+    echo "ERROR: .env not found. Run this script from repo root."; exit 1
+fi
+
+# ============================================================
+# Paths & Names (derived from .env)
+# ============================================================
 TIME=$(date +%Y%m%d%H%M%S)
 
-# ============================================================
-# Teacher model server config (run on a separate 5th node)
-# Start it manually on the teacher node before running this script:
-#   python3 -m sglang.launch_server \
-#       --model-path /path/to/Qwen3-32B \
-#       --host 0.0.0.0 --port 13141 --tp 2 \
-#       --chunked-prefill-size 4096 --mem-fraction-static 0.8
-# ============================================================
-TEACHER_IP="<FILL_IN_TEACHER_NODE_IP>"
-TEACHER_PORT=13141
+TEACHER_IP="6.179.173.207"
+TEACHER_PORT=8000
 TEACHER_MODEL_NAME="Qwen3-32B"
 
+STU_MODEL_PATH="${MODELS_DIR}/Qwen3-8B-Base-sft-dolci-think/iter_0005375-hf/"
+STU_MODEL_PATH_MEG="${MODELS_DIR}/Qwen3-8B-Base-sft-dolci-think/iter_0005375_torch_dist/"
+OUTPUT_DIR="${SLIME_DIR}/outputs/opd_qwen3_8b_sft_dolci_think_${TEACHER_MODEL_NAME}_${TIME}"
+RUN_LOG_DIR="${SLIME_DIR}/logs/run"
+
+source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
+
+# ============================================================
+# Teacher model server health check
+# Start it manually on the teacher node before running this script:
+#   python3 -m sglang.launch_server \
+#       --model-path ${MODELS_DIR}/Qwen3-32B \
+#       --host 0.0.0.0 --port 8000 --tp 2 \
+#       --chunked-prefill-size 4096 --mem-fraction-static 0.8
+# ============================================================
 echo "Waiting for external teacher model server at $TEACHER_IP:$TEACHER_PORT ..."
 until curl -sf http://$TEACHER_IP:$TEACHER_PORT/health_generate > /dev/null; do
     echo "  still waiting..."
@@ -26,26 +46,26 @@ done
 curl http://$TEACHER_IP:$TEACHER_PORT/get_model_info
 echo "Teacher model server is up and running at $TEACHER_IP:$TEACHER_PORT."
 
+# ============================================================
+# NVLink detection
+# ============================================================
+NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+if [ "$NVLINK_COUNT" -gt 0 ]; then HAS_NVLINK=1; else HAS_NVLINK=0; fi
+echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 export PYTHONBUFFERED=16
 
-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
-if [ "$NVLINK_COUNT" -gt 0 ]; then
-    HAS_NVLINK=1
-else
-    HAS_NVLINK=0
-fi
-echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
+# ============================================================
+# Wandb (unset proxy first — wandb server is internal)
+# ============================================================
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+export WANDB_API_KEY WANDB_ENTITY
+export WANDB_PROJECT=slime-rl
+wandb login --relogin --host=${WANDB_HOST} ${WANDB_API_KEY}
 
-
-STU_MODEL_PATH="/jpfs-5p/chenyanxu.9/model/Qwen3-8B-Base-sft-dolci-think/iter_0005375-hf/"
-STU_MODEL_PATH_MEG="/jpfs-5p/chenyanxu.9/model/Qwen3-8B-Base-sft-dolci-think/iter_0005375_torch_dist/"
-
-SLIME_DIR="/jpfs-5p/shenzhennan/slime"
-OUTPUT_DIR="${SLIME_DIR}/outputs/opd_qwen3_8b_sft_dolci_think_${TEACHER_MODEL_NAME}_${TIME}"
-source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
-
-
+# ============================================================
+# Training args
+# ============================================================
 CKPT_ARGS=(
    --hf-checkpoint $STU_MODEL_PATH
    --ref-load $STU_MODEL_PATH_MEG
@@ -53,17 +73,16 @@ CKPT_ARGS=(
    --save-interval 64
 )
 
-DATA_DIR="/jpfs/shenzhennan.1/datasets"
-
 ROLLOUT_ARGS=(
-   --prompt-data ${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
+   --prompt-data ${DATASETS_DIR}/dapo-math-17k/dapo-math-17k.jsonl
    --input-key prompt
+   --label-key label
    --apply-chat-template
    --rollout-shuffle
    --num-rollout 300
    --rollout-batch-size 16
    --n-samples-per-prompt 4
-   --rollout-max-response-len 16384
+   --rollout-max-response-len 30000
    --rollout-temperature 1
 
    --global-batch-size 64
@@ -74,18 +93,20 @@ RM_ARGS=(
    --custom-rm-path slime.rollout.on_policy_distillation.reward_func
    --custom-reward-post-process-path slime.rollout.on_policy_distillation.post_process_rewards
    --rm-url http://$TEACHER_IP:$TEACHER_PORT/generate
+   --custom-rollout-log-function-path slime.utils.opd_log.log_rollout_data
+   --custom-eval-rollout-log-function-path slime.utils.opd_log.log_eval_rollout_data
 )
 
 EVAL_ARGS=(
-   --eval-interval 20
-   --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
-   --n-samples-per-eval-prompt 16
-   --eval-max-response-len 16384
+   --eval-interval 64
+   --eval-prompt-data aime ${DATASETS_DIR}/aime-2024/aime-2024.jsonl
+   --n-samples-per-eval-prompt 8
+   --eval-max-response-len 30000
    --eval-top-p 1
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -96,9 +117,8 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 16384
+   --max-tokens-per-gpu 30000
 )
 
 GRPO_ARGS=(
@@ -121,26 +141,16 @@ OPTIMIZER_ARGS=(
    --adam-beta2 0.98
 )
 
-unset http_proxy
-unset https_proxy
-unset HTTP_PROXY
-unset HTTPS_PROXY
-export WANDB_API_KEY=local-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 # your_wandb_key
-export WANDB_ENTITY=automl # your_wandb_entity
-export WANDB_PROJECT=slime-rl
-wandb login --relogin --host=http://11.71.1.153:8080 ${WANDB_API_KEY}
-
 WANDB_ARGS=(
-   # 取消注释以启用 wandb
    --use-wandb
    --wandb-project slime-opd
    --wandb-group zhennan-slime-opd-qwen3-8b-sft-dolci-think-teacher-${TEACHER_MODEL_NAME}
 )
+
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.4
+   --sglang-mem-fraction-static 0.7
 )
-
 
 MISC_ARGS=(
    --attention-dropout 0.0
@@ -150,9 +160,10 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-
+# ============================================================
+# Launch
+# ============================================================
 CURRENT_DIR=$(pwd)
-# launch the master node of ray in container
 RUNTIME_ENV_JSON="{
   \"working_dir\": \"${CURRENT_DIR}\",
   \"excludes\": [
@@ -168,25 +179,21 @@ RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/:${CURRENT_DIR}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"NCCL_IB_TIMEOUT\": \"22\",
+    \"NCCL_DEBUG\": \"WARN\"
   }
 }"
 
-
-# launch the master node of ray in container
-# export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-# ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
-RUN_LOG_DIR="/jpfs-5p/shenzhennan/slime/logs/run/"
 mkdir -p $RUN_LOG_DIR
 RUN_LOG_FILE="$RUN_LOG_DIR/run_qwen3_8b_sft_dolci_think_${TEACHER_MODEL_NAME}_${TIME}.log"
-
 
 ray job submit  \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 8 \
-   --rollout-num-gpus 24 \
+   --rollout-num-gpus 16 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
@@ -197,16 +204,4 @@ ray job submit  \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
-   ${RM_ARGS[@]} 2>&1 | tee $RUN_LOG_FILE &
-
-
-
-####clear after training
-# pkill -9 sglang
-# sleep 3
-# ray stop --force
-# pkill -9 ray
-# pkill -9 python
-# sleep 3
-# pkill -9 ray
-# pkill -9 python
+   ${RM_ARGS[@]} 2>&1 | tee $RUN_LOG_FILE 

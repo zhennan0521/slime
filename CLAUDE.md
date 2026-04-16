@@ -12,8 +12,8 @@
 在执行上述操作前，先设置代理环境变量：
 
 ```bash
-export http_proxy=socks5h://imfree:Jdea2025@ec2-13-213-15-247.ap-southeast-1.compute.amazonaws.com:3128
-export https_proxy=socks5h://imfree:Jdea2025@ec2-13-213-15-247.ap-southeast-1.compute.amazonaws.com:3128
+export http_proxy=http://221.194.188.92:3128
+export https_proxy=http://221.194.188.92:3128
 ```
 
 ## Git Config
