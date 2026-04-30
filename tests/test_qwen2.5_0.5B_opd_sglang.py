@@ -137,6 +137,8 @@ def execute():
             "--use-opd "
             "--opd-type sglang "
             "--opd-kl-coef 1.0 "
+            f"--opd-token-topk {os.environ.get('SLIME_TEST_OPD_TOKEN_TOPK', '100')} "
+            f"--opd-token-score {os.environ.get('SLIME_TEST_OPD_TOKEN_SCORE', 'kl_divergence')} "
             "--use-kl-loss "
             "--kl-loss-coef 0.00 "
             "--kl-loss-type low_var_kl "

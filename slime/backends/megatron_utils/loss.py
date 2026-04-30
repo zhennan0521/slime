@@ -387,11 +387,40 @@ def apply_opd_kl_to_advantages(
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
 
+    topk_pct = getattr(args, "opd_token_topk", 100)
+    score_type = getattr(args, "opd_token_score", "kl_divergence")
+    apply_topk = topk_pct < 100
+
+    # Note: top-k selection + L_i/k compensation operate over the raw response
+    # length. This is exact for single-turn OPD where loss_mask == all-ones on
+    # the response. For future multi-turn / assistant-only-mask setups the
+    # compensation would need to use the per-sample kept loss_mask count instead.
+
     reverse_kls = []
     for i, adv in enumerate(advantages):
         reverse_kl = student_log_probs[i] - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
-        reverse_kls.append(reverse_kl)
+
+        if apply_topk:
+            L_i = reverse_kl.shape[0]
+            k = max(1, int(L_i * topk_pct / 100))
+
+            if score_type == "random":
+                idx = torch.randperm(L_i, device=reverse_kl.device)[:k]
+            else:  # kl_divergence
+                # upcast to float32 for stable top-k on bf16 values
+                idx = torch.topk(reverse_kl.float(), k).indices
+
+            mask = torch.zeros_like(reverse_kl, dtype=torch.bool)
+            mask[idx] = True
+
+            # sum/N_kept compensation: gradient on kept tokens scaled by L_i / k
+            scale = float(L_i) / float(k)
+            kl_term = args.opd_kl_coef * reverse_kl * mask.to(reverse_kl.dtype) * scale
+        else:
+            kl_term = args.opd_kl_coef * reverse_kl
+
+        advantages[i] = adv - kl_term
+        reverse_kls.append(reverse_kl)  # store ORIGINAL (unmasked) for diagnostics
 
     # Store reverse KL for logging
     rollout_data["opd_reverse_kl"] = reverse_kls

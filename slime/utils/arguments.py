@@ -998,6 +998,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            parser.add_argument(
+                "--opd-token-topk",
+                type=int,
+                default=100,
+                help=(
+                    "OPD token top-k retention percent (1-100). 100 = no masking (default). "
+                    "Kept tokens get gradient scaled by L/k (sum/N_kept compensation) so total "
+                    "update magnitude is preserved."
+                ),
+            )
+            parser.add_argument(
+                "--opd-token-score",
+                type=str,
+                choices=["random", "kl_divergence"],
+                default="kl_divergence",
+                help=(
+                    "Token scoring for OPD top-k selection. "
+                    "'random': uniform sampling (clean density IV). "
+                    "'kl_divergence': top-k by reverse KL (student_logp - teacher_logp)."
+                ),
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -1518,6 +1539,16 @@ def slime_validate_args(args):
     if args.use_opd:
         if args.opd_type is None:
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
+
+        if not (1 <= args.opd_token_topk <= 100):
+            raise ValueError(
+                f"--opd-token-topk must be in [1, 100], got {args.opd_token_topk}."
+            )
+        if args.opd_token_topk < 100 and getattr(args, "context_parallel_size", 1) > 1:
+            raise ValueError(
+                "--opd-token-topk < 100 is incompatible with context_parallel_size > 1. "
+                "CP splits per-sample tensors across ranks, breaking per-sample top-k semantics."
+            )
 
         if args.opd_type == "megatron":
             if args.opd_teacher_load is None:
